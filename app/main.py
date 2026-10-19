@@ -31,6 +31,9 @@ class OrderModification(BaseModel):
     items: list[dict]
     action: Literal["add", "replace"] = "add"
 
+class OrderMessage(BaseModel):
+    message: str
+
 @app.post("/extract")
 def question(request: Message):
     
@@ -305,4 +308,162 @@ def modify_order(order_id: int, request: OrderModification):
         "items": combined_items,
         "total": combined_total,
         "message": "Order items updated successfully.",
+    }
+
+
+@app.patch("/orders/{order_id}/modify-message")
+def modify_order_from_message(
+    order_id: int,
+    request: OrderMessage,
+):
+    # 1. Find the existing order
+    existing_order = get_order_by_id(order_id)
+
+    if existing_order is None:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    if existing_order["status"] != "payment_pending":
+        raise HTTPException(
+            status_code=400,
+            detail="Only payment-pending orders can be modified.",
+        )
+    # Prevent an exact modification message from being applied twice
+    previous_message = existing_order.get("customer_message", "")
+
+    if any(
+        line.strip().lower() == f"modification: {request.message.strip()}".lower()
+        for line in previous_message.splitlines()
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="This modification message has already been applied.",
+        )
+    # 2. Normalize the customer's message
+    normalized_message = normalize_message(request.message)
+
+    # 3. Use the LLM to understand the modification
+    result = extract(normalized_message)
+
+    if result.intent != "modify_order":
+        raise HTTPException(
+            status_code=400,
+            detail="Message was not identified as an order modification.",
+        )
+
+    
+    # 4. Ensure the LLM identified at least one change
+    if not result.changes:
+        raise HTTPException(
+            status_code=400,
+            detail="No order changes were identified in the message.",
+        )
+
+    # 5. Start with the existing order items
+    updated_items = list(existing_order["items"])
+
+    # 6. Apply each requested change
+    for change in result.changes:
+        product = change.product.strip().lower()
+
+        matching_indices = [
+            i for i, item in enumerate(updated_items)
+            if item["product"].strip().lower() == product
+        ]
+
+        if change.action == "add":
+            new_result = process_order([{
+                "product": product,
+                "quantity": change.quantity,
+                "unit": change.unit,
+            }])
+
+            if not new_result["valid"]:
+                raise HTTPException(
+                    status_code=400,
+                    detail=new_result["errors"],
+                )
+
+            updated_items.extend(new_result["items"])
+
+        elif change.action == "remove":
+            if not matching_indices:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"{product} is not in this order.",
+                )
+
+            if len(matching_indices) > 1:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Multiple {product} items found. Specify which size to remove.",
+                )
+
+            updated_items.pop(matching_indices[0])
+
+        elif change.action == "set_quantity":
+            if not matching_indices:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"{product} is not in this order.",
+                )
+
+            if len(matching_indices) > 1:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Multiple {product} items found. Specify which size to change.",
+                )
+
+            if change.quantity is None or change.unit is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Please specify the new size.",
+                )
+
+            new_result = process_order([{
+                "product": product,
+                "quantity": change.quantity,
+                "unit": change.unit,
+            }])
+
+            if not new_result["valid"]:
+                raise HTTPException(
+                    status_code=400,
+                    detail=new_result["errors"],
+                )
+
+            updated_items[matching_indices[0]] = new_result["items"][0]
+
+    # 7. Recalculate the order total
+    combined_total = sum(item["price"] for item in updated_items)
+
+    # 8. Record the modification
+    previous_message = existing_order.get("customer_message", "")
+    updated_message = (
+        f"{previous_message}\nModification: {request.message}"
+    ).strip()
+
+    try:
+        updated = update_order_items(
+            order_id=order_id,
+            customer_message=updated_message,
+            items=updated_items,
+            total=combined_total,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    if not updated:
+        raise HTTPException(
+            status_code=404,
+            detail="Order not found",
+        )
+
+    return {
+        "order_id": order_id,
+        "changes": [
+            change.model_dump() for change in result.changes
+        ],
+        "items": updated_items,
+        "total": combined_total,
+        "message": "Order modified successfully.",
     }

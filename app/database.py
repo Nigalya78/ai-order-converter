@@ -72,8 +72,6 @@ def get_order_by_id(order_id: int):
         order["items"] = json.loads(order.pop("items_json"))
         return order
 
-
-
 def update_order_status(order_id: int, status: str):
     allowed_transitions = {
         "payment_pending": ["confirmed", "cancelled"],

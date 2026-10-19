@@ -70,7 +70,43 @@ MISSING QUANTITY RULES:
 - Set the missing quantity to null.
 - Ask which quantity or package size the customer wants.
 - Do not treat an incomplete order as a product enquiry.
+
+ORDER MODIFICATION RULES:
+- If the customer asks to add an item to an existing order,
+  classify the intent as "modify_order".
+- Words and phrases such as "add", "also add", "include",
+  and " சேர்த்து" indicate an order modification when referring
+  to an existing order.
+- For modifications, put each requested change in the "changes"
+  list.
+- Use action "add" for items being added.
+- Example:
+  Message: "Add 250g mixture also"
+  Intent: "modify_order"
+  Changes: [{"action": "add", "product": "mixture",
+             "quantity": 250, "unit": "g"}]
+
+For order modifications, always use the changes field.
+
+Examples:
+- "Add 250g mixture also"
+  -> intent: modify_order
+  -> changes: [{action: "add", product: "mixture",
+                quantity: 250, unit: "g"}]
+
+- "Remove the laddu"
+  -> intent: modify_order
+  -> changes: [{action: "remove", product: "laddu"}]
+
+- "Change murukku to 500g"
+  -> intent: modify_order
+  -> changes: [{action: "set_quantity", product: "murukku",
+                quantity: 500, unit: "g"}]
+
+For modify_order, do not put modifications in items.
+Use changes only. If the message is ambiguous, ask for clarification.
 """
+
             },
             {
                 "role":"user",
@@ -84,7 +120,6 @@ MISSING QUANTITY RULES:
     data = json.loads(response["message"]["content"])
     if data.get("intent") == "new_order":
         data["changes"] = []
-
 
     message_lower = message.lower()
 
@@ -104,7 +139,6 @@ MISSING QUANTITY RULES:
         data["needs_clarification"] = False
         data["clarification_question"] = None
 
-        # Recover product and size from the LLM's extracted changes
         extracted_items = data.get("items", [])
         extracted_changes = data.get("changes", [])
 
