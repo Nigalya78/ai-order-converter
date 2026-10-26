@@ -1,4 +1,5 @@
-from fastapi import FastAPI,HTTPException
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from app.llm_service import extract
 from app.order_engine import process_order
@@ -9,15 +10,33 @@ from app.database import (
     get_order_by_id,
     update_order_status,
     update_order_items,
+    save_pending_clarification,
+    get_pending_clarification,
+    get_order_stats,
+    format_whatsapp_receipt,
+    get_chat_session,
+    get_chat_messages,
+    reset_chat_session,
 )
+import urllib.parse
 from typing import Literal
 from app.catalog import PRODUCT_CATALOG
 from app.text_normalizer import normalize_message
 from app.rule_parser import parse_simple_order
-from app.text_normalizer import normalize_message
-from app.schemas import OrderExtraction
+from app.schemas import OrderExtraction, OrderChange, ChatRequest, ChatResponse
+import re
+from app.chat_service import process_chat_message
 
 app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 init_db()
 
 class Message(BaseModel):
@@ -45,8 +64,6 @@ def question(request: Message):
         result = OrderExtraction.model_validate(parsed)
     else:
         result = extract(normalized_message)
-        
-    # Handle product enquiries
     if result.intent == "product_enquiry":
         product_name = (
             result.items[0].product.strip().lower()
@@ -68,8 +85,6 @@ def question(request: Message):
                 ),
             }
         variants = product["variants"]
-
-        # Check whether the customer requested a specific size
         requested_size = None
 
         if result.items:
@@ -139,8 +154,6 @@ def question(request: Message):
             "prices": price_details,
             "message": response_message,
         }
-
-    # Handle cancellation requests separately
     if result.intent == "cancel_order":
         return {
             "extraction": result,
@@ -149,8 +162,6 @@ def question(request: Message):
             "status": None,
             "message": "Cancellation request detected. Please identify the existing order."
         }
-
-    # Handle unclear messages
     if result.intent == "unclear":
         return {
             "extraction": result,
@@ -159,8 +170,6 @@ def question(request: Message):
             "status": None,
             "message": result.clarification_question or "Could you clarify your request?"
         }
-
-    # Check whether any item has a missing quantity
     if (
         result.intent in {"new_order", "modify_order"}
         and any(
@@ -173,7 +182,6 @@ def question(request: Message):
             result.clarification_question = (
                 "Please specify the quantity or package size."
             )
-    # Stop here if clarification is needed
     if result.needs_clarification:
         return {
             "extraction": result,
@@ -183,7 +191,6 @@ def question(request: Message):
                 or "Please specify the quantity or package size."
             ),
         }
-    # Process the order only when clarification is not needed
     order_result = process_order(
         [item.model_dump() for item in result.items]
     )
@@ -207,8 +214,101 @@ def question(request: Message):
         "status": "payment_pending" if order_id is not None else None,
     }
 
+@app.post("/chat", response_model=ChatResponse)
+def chat_endpoint(request: ChatRequest):
+    """
+    Conversational AI Chat-to-Order endpoint.
+    Maintains multi-turn context, draft cart, product enquiries, and order placement.
+    """
+    if not request.message or not request.message.strip():
+        raise HTTPException(status_code=400, detail="Message cannot be empty.")
+
+    try:
+        result = process_chat_message(request.session_id, request.message)
+        return result
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Chat processing error: {str(exc)}")
+
+
+@app.get("/chat/sessions/{session_id}")
+def get_chat_session_endpoint(session_id: str):
+    """
+    Retrieves full conversation session state, draft cart, and chronological history.
+    Enables resuming conversations seamlessly after a browser refresh.
+    """
+    session = get_chat_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Conversation session not found.")
+
+    messages = get_chat_messages(session_id)
+    return {
+        "session_id": session["session_id"],
+        "cart": session.get("cart", {"items": [], "total": 0}),
+        "pending_confirmation": session.get("pending_confirmation", False),
+        "created_order_id": session.get("created_order_id"),
+        "messages": messages,
+    }
+
+
+@app.post("/chat/sessions/{session_id}/reset")
+def reset_chat_session_endpoint(session_id: str):
+    """
+    Resets the active draft cart and context while keeping the session intact.
+    """
+    session = get_chat_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Conversation session not found.")
+
+    reset_state = reset_chat_session(session_id)
+    return {
+        "message": "Session reset successfully.",
+        "session": reset_state,
+    }
+
+
+@app.get("/catalog")
+def get_catalog():
+    """Returns the snack product catalogue with available variants and pricing."""
+    formatted_catalog = []
+    for product_id, details in PRODUCT_CATALOG.items():
+        formatted_catalog.append({
+            "id": product_id,
+            "name": details.get("name", product_id.title()),
+            "category": details.get("category", "Snack"),
+            "description": details.get("description", ""),
+            "variants": [
+                {"size": size, "price": price}
+                for size, price in details["variants"].items()
+            ],
+        })
+    return {"products": formatted_catalog}
+
+
+@app.get("/orders/stats")
+def order_statistics():
+    """Returns aggregated operational and financial statistics."""
+    return get_order_stats()
+
+
+@app.get("/orders/{order_id}/receipt")
+def get_order_receipt(order_id: int):
+    """Generates customer receipt formatted for WhatsApp."""
+    order = get_order_by_id(order_id)
+    if order is None:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    receipt_text = format_whatsapp_receipt(order)
+    encoded_text = urllib.parse.quote(receipt_text)
+
+    return {
+        "order_id": order_id,
+        "receipt": receipt_text,
+        "whatsapp_url": f"https://wa.me/?text={encoded_text}",
+    }
+
+
 @app.get("/orders")
-def list_orders(status: str | None = None):
+def list_orders(status: str | None = None, search: str | None = None):
     orders = get_orders()
 
     allowed_statuses = {
@@ -227,6 +327,15 @@ def list_orders(status: str | None = None):
         orders = [
             order for order in orders
             if order["status"] == status
+        ]
+
+    if search is not None and search.strip():
+        q = search.lower().strip()
+        orders = [
+            order for order in orders
+            if q in str(order["order_id"])
+            or q in (order.get("customer_message") or "").lower()
+            or any(q in item.get("product", "").lower() for item in order.get("items", []))
         ]
 
     return {
@@ -262,7 +371,6 @@ def change_order_status(order_id: int, request: OrderStatusUpdate):
 
 @app.patch("/orders/{order_id}/items")
 def modify_order(order_id: int, request: OrderModification):
-    # 1. Find the existing order
     existing_order = get_order_by_id(order_id)
 
     if existing_order is None:
@@ -273,23 +381,15 @@ def modify_order(order_id: int, request: OrderModification):
             status_code=400,
             detail="Only payment-pending orders can be modified.",
         )
-
-    # 2. Process the newly submitted items
     new_result = process_order(request.items)
 
     if not new_result["valid"]:
         raise HTTPException(status_code=400, detail=new_result["errors"])
-
-    # 3. Add new items or replace existing items
     if request.action == "add":
         combined_items = existing_order["items"] + new_result["items"]
     else:
         combined_items = new_result["items"]
-
-    # 4. Recalculate the total from all items
     combined_total = sum(item["price"] for item in combined_items)
-
-    # 5. Save the updated order
     try:
         updated = update_order_items(
             order_id=order_id,
@@ -311,12 +411,12 @@ def modify_order(order_id: int, request: OrderModification):
     }
 
 
+
 @app.patch("/orders/{order_id}/modify-message")
 def modify_order_from_message(
     order_id: int,
     request: OrderMessage,
 ):
-    # 1. Find the existing order
     existing_order = get_order_by_id(order_id)
 
     if existing_order is None:
@@ -327,22 +427,234 @@ def modify_order_from_message(
             status_code=400,
             detail="Only payment-pending orders can be modified.",
         )
-    # Prevent an exact modification message from being applied twice
     previous_message = existing_order.get("customer_message", "")
 
     if any(
-        line.strip().lower() == f"modification: {request.message.strip()}".lower()
+        line.strip().lower()
+        == f"modification: {request.message.strip()}".lower()
         for line in previous_message.splitlines()
     ):
         raise HTTPException(
             status_code=409,
             detail="This modification message has already been applied.",
         )
-    # 2. Normalize the customer's message
-    normalized_message = normalize_message(request.message)
+    pending = get_pending_clarification(order_id)
 
-    # 3. Use the LLM to understand the modification
-    result = extract(normalized_message)
+    if pending:
+        reply = normalize_message(request.message).strip().lower()
+        pending_changes = pending.get("changes", [])
+
+        size_map = {
+            "250g": (250, "g"),
+            "250 g": (250, "g"),
+            "500g": (500, "g"),
+            "500 g": (500, "g"),
+            "1kg": (1, "kg"),
+            "1 kg": (1, "kg"),
+        }
+
+        if reply in size_map:
+            if len(pending_changes) != 1:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Could not identify which item needs a size.",
+                )
+
+            pending_change = pending_changes[0]
+            action = pending_change.get("action")
+            product = pending_change.get("product")
+
+            if action not in {"add", "set_quantity"} or not product:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "This pending modification cannot be "
+                        "completed with a size alone."
+                    ),
+                )
+
+            quantity, unit = size_map[reply]
+            result = OrderExtraction(
+                intent="modify_order",
+                items=[],
+                changes=[
+                    OrderChange(
+                        action=action,
+                        product=product,
+                        quantity=quantity,
+                        unit=unit,
+                    )
+                ],
+                needs_clarification=False,
+                clarification_question=None,
+            )
+
+        else:
+            original_message = pending["message"]
+            combined_message = (
+                f"{original_message}. Customer clarification: "
+                f"{request.message.strip()}"
+            )
+            result = extract(normalize_message(combined_message))
+
+    else:
+        normalized_message = normalize_message(request.message).strip()
+        add_match = re.fullmatch(
+            r"add\s+(\d+(?:\.\d+)?)\s*"
+            r"(kilograms?|kg|grams?|g)\s+(.+)",
+            normalized_message,
+            re.IGNORECASE,
+        )
+
+        if add_match:
+            quantity = float(add_match.group(1))
+            unit_text = add_match.group(2).lower()
+            product = add_match.group(3).strip().lower()
+
+            unit = (
+                "kg"
+                if unit_text.startswith("kg")
+                or unit_text.startswith("kilogram")
+                else "g"
+            )
+
+            result = OrderExtraction(
+                intent="modify_order",
+                items=[],
+                changes=[
+                    OrderChange(
+                        action="add",
+                        product=product,
+                        quantity=quantity,
+                        unit=unit,
+                    )
+                ],
+                needs_clarification=False,
+                clarification_question=None,
+            )
+        
+        else:
+            tanglish_size_change = re.fullmatch(
+                r"([a-zA-Z]+)\s+(\d+(?:\.\d+)?)\s*"
+                r"(kg|kgs|kilograms?|g|gm|gms|grams?)"
+                r"(?:\s+(podhum|mattum\s+venum|ah\s+mathunga))?",
+                normalized_message,
+                re.IGNORECASE,
+            )
+            print("DEBUG normalized:", repr(normalized_message))
+            print("DEBUG Tanglish match:", tanglish_size_change)
+            if tanglish_size_change:
+                product = tanglish_size_change.group(1).lower()
+                quantity = float(tanglish_size_change.group(2))
+                unit_text = tanglish_size_change.group(3).lower()
+
+                unit = (
+                    "kg"
+                    if unit_text.startswith(("kg", "kilo"))
+                    else "g"
+                )
+
+                result = OrderExtraction(
+                    intent="modify_order",
+                    items=[],
+                    changes=[
+                        OrderChange(
+                            action="set_quantity",
+                            product=product,
+                            quantity=quantity,
+                            unit=unit,
+                        )
+                    ],
+                    needs_clarification=False,
+                    clarification_question=None,
+                )
+            else:
+                result = extract(normalized_message)
+    incomplete_changes = any(
+        (
+            change.action in {"add", "set_quantity"}
+            and (
+                not change.product
+                or change.quantity is None
+                or change.unit is None
+            )
+        )
+        or (
+            change.action == "remove"
+            and not change.product
+        )
+        for change in result.changes
+    )
+
+    if incomplete_changes:
+        result.needs_clarification = True
+
+        if not result.clarification_question:
+            change = next(
+                change
+                for change in result.changes
+                if (
+                    change.action in {"add", "set_quantity"}
+                    and (
+                        not change.product
+                        or change.quantity is None
+                        or change.unit is None
+                    )
+                )
+                or (
+                    change.action == "remove"
+                    and not change.product
+                )
+            )
+
+            if change.action == "add":
+                if not change.product:
+                    question = "Which product would you like to add?"
+                else:
+                    question = (
+                        f"What size of {change.product} "
+                        "would you like to add?"
+                    )
+            elif change.action == "set_quantity":
+                if not change.product:
+                    question = "Which product would you like to change?"
+                else:
+                    question = (
+                        f"What new size of {change.product} "
+                        "would you like?"
+                    )
+            else:
+                question = "Which product would you like to remove?"
+
+            result.clarification_question = question
+    if result.needs_clarification:
+        save_pending_clarification(
+            order_id,
+            {
+                "message": (
+                    pending["message"]
+                    if pending
+                    else request.message.strip()
+                ),
+                "changes": [
+                    change.model_dump()
+                    for change in result.changes
+                ],
+            },
+        )
+
+        return {
+            "order_id": order_id,
+            "needs_clarification": True,
+            "message": (
+                result.clarification_question
+                or "Could you clarify the requested modification?"
+            ),
+            "changes": [
+                change.model_dump()
+                for change in result.changes
+            ],
+        }
 
     if result.intent != "modify_order":
         raise HTTPException(
@@ -350,32 +662,36 @@ def modify_order_from_message(
             detail="Message was not identified as an order modification.",
         )
 
-    
-    # 4. Ensure the LLM identified at least one change
     if not result.changes:
         raise HTTPException(
             status_code=400,
             detail="No order changes were identified in the message.",
         )
-
-    # 5. Start with the existing order items
     updated_items = list(existing_order["items"])
 
-    # 6. Apply each requested change
     for change in result.changes:
+        if not change.product:
+            raise HTTPException(
+                status_code=400,
+                detail="Product is required for this modification.",
+            )
+
         product = change.product.strip().lower()
 
         matching_indices = [
-            i for i, item in enumerate(updated_items)
+            i
+            for i, item in enumerate(updated_items)
             if item["product"].strip().lower() == product
         ]
 
         if change.action == "add":
-            new_result = process_order([{
-                "product": product,
-                "quantity": change.quantity,
-                "unit": change.unit,
-            }])
+            new_result = process_order([
+                {
+                    "product": product,
+                    "quantity": change.quantity,
+                    "unit": change.unit,
+                }
+            ])
 
             if not new_result["valid"]:
                 raise HTTPException(
@@ -395,7 +711,10 @@ def modify_order_from_message(
             if len(matching_indices) > 1:
                 raise HTTPException(
                     status_code=400,
-                    detail=f"Multiple {product} items found. Specify which size to remove.",
+                    detail=(
+                        f"Multiple {product} items found. "
+                        "Specify which size to remove."
+                    ),
                 )
 
             updated_items.pop(matching_indices[0])
@@ -410,20 +729,19 @@ def modify_order_from_message(
             if len(matching_indices) > 1:
                 raise HTTPException(
                     status_code=400,
-                    detail=f"Multiple {product} items found. Specify which size to change.",
+                    detail=(
+                        f"Multiple {product} items found. "
+                        "Specify which size to change."
+                    ),
                 )
 
-            if change.quantity is None or change.unit is None:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Please specify the new size.",
-                )
-
-            new_result = process_order([{
-                "product": product,
-                "quantity": change.quantity,
-                "unit": change.unit,
-            }])
+            new_result = process_order([
+                {
+                    "product": product,
+                    "quantity": change.quantity,
+                    "unit": change.unit,
+                }
+            ])
 
             if not new_result["valid"]:
                 raise HTTPException(
@@ -432,14 +750,9 @@ def modify_order_from_message(
                 )
 
             updated_items[matching_indices[0]] = new_result["items"][0]
-
-    # 7. Recalculate the order total
     combined_total = sum(item["price"] for item in updated_items)
-
-    # 8. Record the modification
-    previous_message = existing_order.get("customer_message", "")
     updated_message = (
-        f"{previous_message}\nModification: {request.message}"
+        f"{previous_message}\nModification: {request.message.strip()}"
     ).strip()
 
     try:
@@ -453,10 +766,8 @@ def modify_order_from_message(
         raise HTTPException(status_code=400, detail=str(exc))
 
     if not updated:
-        raise HTTPException(
-            status_code=404,
-            detail="Order not found",
-        )
+        raise HTTPException(status_code=404, detail="Order not found")
+    save_pending_clarification(order_id, None)
 
     return {
         "order_id": order_id,
